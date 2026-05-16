@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenttienlen"
+version = "0.1.0"
+description = "Real-time Tien Len Mien Nam bot with YOLOv8 vision and rule-based agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "weijinn97-ai" }]
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "Pillow>=10.0",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+vision = [
+    "ultralytics>=8.1",
+    "torch>=2.2",
+]
+emulator = [
+    "adbutils>=2.4",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.9",
+]
+
+[project.scripts]
+agenttienlen = "agenttienlen.orchestrator.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"agenttienlen" = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B018"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+namespace_packages = true
+explicit_package_bases = true
+ignore_missing_imports = true
