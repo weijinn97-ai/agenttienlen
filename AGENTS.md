@@ -220,6 +220,34 @@ class SeatMap:
 Nguyên tắc: `Seat` quyết định logic game; `display_name` chỉ dùng cho log/replay/debug.
 Không dùng `display_name` để quyết định lượt hay chiến thuật.
 
+### 3.5.1. Contract files đã merge (vision foundation, PR #2)
+
+Foundation PR đã chốt contract layer — agent code reader cụ thể PHẢI dùng các type và Protocol bên dưới, KHÔNG tự định nghĩa lại.
+
+| File | Public surface | Vai trò |
+|---|---|---|
+| `vision/structured_frame.py` | `Rect`, `Seat`, `ButtonName`, `CardCandidate`, `ButtonState`, `PlayerProfile`, `SeatMap`, `StructuredFrame` | Pure data; tất cả `frozen=True, slots=True`; có `__post_init__` validate confidence ∈ [0,1] và `width/height ≥ 0`. |
+| `vision/layout.py` | `RegionName` (22 vùng), `ROI`, `default_layout_1280x720()` (legacy 5 vùng cho `yolo_detector`), `full_layout_1280x720()` (22 ROI cho pipeline), `scale_layout()`, `assign_region()` | ROI map duy nhất, đã calibrate với screenshot 1280×720. |
+| `vision/layout_router.py` | `RegionCrop`, `LayoutRouter.split(frame)`, `LayoutRouter.crop(frame, region)` | Crop frame → per-region; clip biên; trả numpy view (no copy). |
+| `vision/stabilizer.py` | `FrameStabilizer[T]`, `StableResult[T]` | N-of-N consecutive-match gate (§3.3); generic, dùng `key_fn` để định nghĩa "same". |
+| `vision/readers.py` | `HandReader`, `TableReader`, `OpponentReader`, `PlayerIdentityReader`, `TurnDetector` (Protocol) + `HandReadResult`, `TableReadResult`, `TurnReadResult` | Contract cho 5 reader PR tiếp theo. |
+| `vision/pipeline.py` | `StructuredFramePipeline(router, hand, table, opp, identity, turn)` | Stateless orchestrator; gọi router → 5 reader → assemble `StructuredFrame`. |
+
+Quyết định đã chốt trong foundation PR (KHÔNG relitigate khi code reader):
+
+| Quyết định | Lý do |
+|---|---|
+| `Seat` (vision-side, ME/OPP_LEFT/OPP_TOP/OPP_RIGHT) tách riêng khỏi `memory.game_state.PlayerSeat` | Vision label theo vị trí vật lý; memory label theo logic chia bài. Orchestrator map giữa hai bên. |
+| Reader nhận `RegionCrop` (không phải full frame) | Mỗi reader chỉ thấy slice của mình; không thể đè nhầm vùng khác. |
+| `TurnDetector.read(button_crops, avatar_crops)` nhận cả hai map | Detector cần cả "nút có visible không" và "ai đang highlight". |
+| `PlayerIdentityReader.read(avatar_crops, name_crops)` tách avatar/name | OCR và avatar matching dùng pipeline khác nhau; tách map giúp cache độc lập. |
+| Pipeline trả empty result khi không có crop (không raise) | Calibration drift không được crash bot mid-game. |
+| `mypy` không chạy trong CI nhưng `vision/*` mới phải pass `mypy --strict` | Tránh kéo theo lỗi pre-existing ở `yolo_detector.py` / `core/enumerate.py`. |
+| Reader KHÔNG được `import numpy` ở top-level | Dùng `TYPE_CHECKING` guard — vision Protocol module phải load được mà không cần numpy. |
+
+Reader PR tiếp theo (mỗi PR 1 reader, độc lập, có thể song song):
+`vision-hand-reader`, `vision-table-reader`, `vision-opponent-reader`, `vision-player-identity`, `vision-turn-detector`. Mỗi PR chỉ thêm 1 file `<reader>.py` + tests; KHÔNG sửa contract trong foundation files.
+
 ### 3.6. Module contracts (để agent không đè nhau)
 
 | Module | Input | Output | KHÔNG được làm |
@@ -399,26 +427,25 @@ agenttienlen/
 │   ├── core/         Card, Combo, beats, enumerate (STABLE)
 │   ├── memory/       GameState, DeckTracker (STABLE)
 │   ├── vision/       YOLO detector skeleton + labels + ROI layout
+│   │                 + foundation: structured_frame, layout_router,
+│   │                   stabilizer, readers (Protocol), pipeline (§3.5.1)
 │   ├── agent/        HeuristicPolicy + Policy Protocol (STABLE)
 │   ├── io_ctrl/      ADB tap + GameActions
 │   └── orchestrator/ Main loop + config
-└── tests/            62 tests cho core/memory/agent
+└── tests/            111 tests cho core/memory/agent/vision
 ```
 
-Sau khi vision multi-reader có dataset + weights, thêm:
+Sau khi mỗi reader PR có dataset + weights, thêm (mỗi dòng = 1 PR):
 
 ```
 src/agenttienlen/vision/
-├── layout_router.py             (vision-layout-router)
 ├── hand_segmenter.py            (vision-hand-reader)
 ├── card_corner_classifier.py    (vision-hand-reader)
 ├── hand_reader.py               (vision-hand-reader)
 ├── table_reader.py              (vision-table-reader)
 ├── opponent_reader.py           (vision-opponent-reader)
 ├── identity_reader.py           (vision-identity-reader)
-├── turn_detector.py             (vision-turn-detector)
-├── stabilizer.py                (vision-stabilizer)
-└── pipeline.py                  (vision-pipeline-integrate)
+└── turn_detector.py             (vision-turn-detector)
 
 scripts/
 ├── extract_cards_from_screenshot.py  (vision-extract)
