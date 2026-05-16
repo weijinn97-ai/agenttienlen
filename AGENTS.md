@@ -11,7 +11,7 @@
 - Repo: https://github.com/weijinn97-ai/agenttienlen — bot Tiến Lên Miền Nam realtime
 - Stack: Python 3.11+, ruff (lint+format), pytest, mypy strict, GitHub Actions CI
 - Kiến trúc: **6 module độc lập** — một agent claim một module hoặc một task.
-- Vision: **YOLOv8** (đã chốt, KHÔNG đổi sang template matching).
+- Vision: **multi-reader theo ROI** (xem §3.5) — `HandReader` (corner classifier) + `TableReader` (YOLO) + `OpponentReader` (back counter) + `PlayerIdentityReader` (OCR), KHÔNG template matching, KHÔNG single global YOLO.
 - Agent: **heuristic chuẩn SGK** (đã chốt, KHÔNG dùng ML/RL ở v1).
 - Branch: `devin/<timestamp>-<slug>`; KHÔNG push thẳng `main`; mọi thay đổi qua PR.
 - Lint + test phải pass trước khi mở PR: `ruff check src tests && ruff format --check src tests && pytest -ra`.
@@ -22,8 +22,8 @@
 
 Bot chơi Tiến Lên Miền Nam (luật **Nhất Ăn Tất**) tự động, real-time:
 
-1. **Nhìn**: nhận diện toàn bộ lá bài trên màn hình (tay mình + giữa bàn + 3 đối thủ) bằng YOLOv8.
-2. **Ghi nhớ**: track 52-card deck (lá nào đã đánh, lá nào còn) + game state.
+1. **Nhìn**: chia màn hình theo ROI → mỗi vùng có reader riêng (tay mình: corner classifier, giữa bàn: YOLO, đối thủ: back-card counter, identity: OCR tên) → trả `StructuredFrame`.
+2. **Ghi nhớ**: track 52-card deck (lá nào đã đánh, lá nào còn) + game state + `SeatMap` (seat ↔ display name).
 3. **Quyết định**: heuristic chuẩn SGK (đánh / chặt / bỏ lượt / giữ bom).
 4. **Tap**: tự bấm bài qua ADB vào emulator (MEmu).
 5. **Modular**: nhiều Devin agent làm song song không đụng nhau.
@@ -53,7 +53,7 @@ Repo bắt đầu từ commit `731cebb` (initial skeleton). Đọc git log để
 src/agenttienlen/
 ├── core/           # Pure game logic — KHÔNG đụng trừ khi user cập nhật luật
 ├── memory/         # GameState + DeckTracker
-├── vision/         # YOLOv8 card detector
+├── vision/         # Multi-reader (Hand corner classifier + Table YOLO + Opponent counter + Identity OCR)
 ├── agent/          # Decision engine (heuristic + future minimax)
 ├── io_ctrl/        # ADB tap / click
 └── orchestrator/   # Main loop: capture → detect → decide → act
@@ -68,17 +68,25 @@ Mỗi module có `README.md` riêng (xem `src/agenttienlen/<module>/README.md`).
 [Frame 1280x720 BGR numpy]
         │
         ▼
-vision/yolo_detector.YoloCardDetector.infer(frame)
-        │ → FrameResult { detections, by_region(), cards_in() }
+vision/layout_router.split(frame)
+        │ → {MY_HAND, TABLE, OPP_LEFT, OPP_TOP, OPP_RIGHT, BUTTONS, TURN_INDICATOR} crops
         ▼
-vision/stabilizer (temporal voting qua N frame)
-        │ → StableFrame (cards/back/button đã ổn định)
+vision/pipeline.StructuredFramePipeline.read(crops)
+        │   ├─ HandReader: segment slots → corner classifier (rank+suit) → my_hand_candidates
+        │   ├─ TableReader: YOLO detect các lá ngửa → table_cards + combo
+        │   ├─ OpponentReader: đếm back-card per seat → opponent_back_counts
+        │   ├─ PlayerIdentityReader: OCR tên/avatar → player_profiles, SeatMap
+        │   └─ TurnDetector: button/highlight/timer → ui_buttons, turn_indicators
+        │ → StructuredFrame (xem §3.5)
+        ▼
+vision/stabilizer (temporal voting qua N frame, xem §3.3)
+        │ → StableStructuredFrame (mỗi vùng có cờ ổn định riêng)
         ▼
 orchestrator/state_machine.transition(stable_frame)
         │ → State (xem §3.2) — agent chỉ được gọi khi state ∈ {MY_TURN_FREE, MY_TURN_RESPONSE}
         ▼
 memory/game_state._update_from_stable_frame()
-        │ → GameState { hand, current_combo, last_player, seat_card_counts, ... }
+        │ → GameState { hand, current_combo, last_play (player+cards), seat_map, opponent_card_count, ... }
         ▼
 agent/heuristic.HeuristicPolicy.decide(state)
         │ → Action (Play(combo) | Pass(reason))
@@ -95,8 +103,11 @@ ADB tap → Emulator (MEmu, 1280x720)
 io_ctrl/verification.verify_action_applied()
         │ → OK → loop tiếp; FAIL → state = RECOVERING
         ▼
-tools/replay_logger.log(frame, detections, stable, state, decision, taps, verify)
+tools/replay_logger.log(frame, structured_frame, stable, state, decision, taps, verify, seat_map)
 ```
+
+> **Nguyên tắc**: "Nhận diện vị trí trước, nhận diện quân bài sau, rồi dùng state machine để hiểu lá đó thuộc về ai."
+> Vision KHÔNG trả `List[Card]` phẳng. Vision trả `StructuredFrame` chia theo vùng. Việc gán lá cho người chơi thuộc về `GameState` + `TurnDetector`.
 
 ### 3.2. Orchestrator state machine 7-state (safety spec)
 
@@ -137,16 +148,93 @@ Thư mục code dự kiến: `src/agenttienlen/vision/stabilizer.py` — input: 
 Bot real-time thua/đánh sai → nhìn lại màn hình không đủ. Mỗi action phải log đủ để **replay offline** không cần MEmu.
 
 Mỗi tick log:
+- `hand_id`, `frame_id`, `timestamp_ms` (để truy vết theo ván)
 - Raw frame (jpg, downsampled OK)
-- Raw detections (class, bbox, confidence)
+- `StructuredFrame` (per-region, kèm bbox + confidence mỗi candidate)
 - Stabilized state (sau temporal voting)
-- `GameState` (hand, current_combo, seat counts, …)
+- `GameState` (hand, current_combo, last_play, seat counts, …)
+- `SeatMap` snapshot (seat ↔ display_name + name_confidence + avatar_roi crop)
 - Legal moves từ `enumerate_moves()`
 - Policy decision + lý do chọn
 - Tap coordinates
 - Post-tap verification kết quả
 
+Mỗi event quan trọng (vd `opponent_play_detected`) phải kèm `seat` + `display_name` + `name_confidence` + `hand_id` + `frame_id` để người xem log truy nguyên đúng người chơi.
+
 Thư mục code dự kiến: `tools/replay_logger.py` + `tools/replay_viewer.py`.
+
+### 3.5. Vision multi-reader theo ROI (KHÔNG single global YOLO)
+
+Lý do KHÔNG dùng 1 YOLOv8 global phủ cả màn hình:
+
+- Bài trên tay 60-80% bị che (fan-out overlap), chỉ lộ corner ~20×25 px → YOLO dễ nhầm / miss.
+- 3 size scale khác nhau (hand 75×125 / table 50×85 / opponent 40×70 px) → detector chung khó tối ưu.
+- Background, ROI, ngữ nghĩa (lá của ai) khác nhau giữa vùng → tách reader dễ debug + thay thế từng module.
+
+5 reader độc lập + 1 stabilizer:
+
+| Reader | Input | Output | Approach |
+|---|---|---|---|
+| `LayoutRouter` | Full frame | ROI crops (`MY_HAND`, `TABLE`, `OPP_*`, `BUTTONS`, `TURN_INDICATOR`) | Hard-coded ROI từ calibration |
+| `HandReader` | `MY_HAND` ROI | `my_hand_candidates: list[CardCandidate]` | Segment slot theo trục X → crop corner trang trên-trái → rank classifier (13) + suit classifier (4) |
+| `TableReader` | `TABLE` ROI | `table_cards: list[CardCandidate]` + `combo` | YOLOv8 detect 52 cards (không cần back ở table) → parse combo |
+| `OpponentReader` | `OPP_*` ROIs | `opponent_back_counts: dict[Seat, int]` | Edge/contour hoặc template back → đếm số lá, KHÔNG đọc rank/suit |
+| `PlayerIdentityReader` | Avatar/name ROIs | `player_profiles: dict[Seat, PlayerProfile]` + `SeatMap` | OCR tên + crop avatar; chốt khi `WAITING_FOR_GAME`/`DEALING_OR_SORTING` |
+| `TurnDetector` | `BUTTONS` + `TURN_INDICATOR` ROIs | `ui_buttons`, `turn_indicators` | Phone-icon highlight / nu00fat `Đánh`/`Bỏ` / timer |
+
+`StructuredFrame` (output của vision/pipeline):
+
+```python
+@dataclass
+class StructuredFrame:
+    my_hand_candidates: list[CardCandidate]
+    table_cards: list[CardCandidate]
+    opponent_back_counts: dict[Seat, int]
+    player_profiles: dict[Seat, PlayerProfile]
+    ui_buttons: dict[str, ButtonState]
+    turn_indicators: dict[Seat, float]
+    timestamp_ms: int
+    frame_id: int
+```
+
+`SeatMap` (bắt buộc có trong mọi log event):
+
+```python
+@dataclass
+class PlayerProfile:
+    seat: Seat
+    display_name: str | None
+    raw_name_text: str | None
+    name_confidence: float
+    avatar_roi: Rect
+    name_roi: Rect
+    is_bot: bool = False
+
+@dataclass
+class SeatMap:
+    hand_id: str
+    room_id: str | None
+    players: dict[Seat, PlayerProfile]
+```
+
+Nguyên tắc: `Seat` quyết định logic game; `display_name` chỉ dùng cho log/replay/debug.
+Không dùng `display_name` để quyết định lượt hay chiến thuật.
+
+### 3.6. Module contracts (để agent không đè nhau)
+
+| Module | Input | Output | KHÔNG được làm |
+|---|---|---|---|
+| `vision/layout_router` | Screenshot | ROI crops | Parse card. |
+| `vision/hand_reader` | `MY_HAND` ROI | `my_hand_candidates` | Quyết định nước đánh. |
+| `vision/table_reader` | `TABLE` ROI | `table_cards`, `combo` | Tự gán người chơi. |
+| `vision/opponent_reader` | Opponent ROIs | `back_counts` | Đoán rank/suit lá úp. |
+| `vision/identity_reader` | Avatar/name ROIs | `PlayerProfile`, `SeatMap` | Dùng tên để quyết định lượt / strategy. |
+| `vision/turn_detector` | UI/seat/button ROIs | `current_turn`, confidence | Mutate `GameState` trực tiếp. |
+| `vision/stabilizer` | Observations | Stable observations | Sinh quyết định đánh. |
+| `memory/game_state` | Stable obs + `SeatMap` | `GameState` chính thức | Xử lý ảnh raw. |
+| `tools/replay_logger` | Frame, detections, state, action, `SeatMap` | Debug bundle theo ván | Sửa state hoặc chọn action. |
+| `agent/heuristic` | `GameState` | `Action` | Đọc screenshot trực tiếp. |
+| `io_ctrl/executor` | `Action` | Tap events + result | Chọn strategy. |
 
 ---
 
@@ -156,12 +244,13 @@ Thư mục code dự kiến: `tools/replay_logger.py` + `tools/replay_viewer.py`
 |---|---|---|
 | 1 | Repo riêng `agenttienlen` (không reuse `Tienlenchuan`) | User yêu cầu tách hẳn |
 | 2 | Python 3.11+, ruff, mypy strict | Type-safe, stable |
-| 3 | **YOLOv8** cho vision (KHÔNG template matching) | Cards fan-out overlap, multi-size (3 scales: 75x125 / 50x85 / 40x70 px) |
+| 3 | **Vision multi-reader theo ROI** (xem §3.5): HandReader corner classifier, TableReader YOLOv8, OpponentReader back counter, PlayerIdentityReader OCR. KHÔNG template matching, KHÔNG single global YOLO. | Cards fan-out overlap, multi-size (3 scales: 75x125 / 50x85 / 40x70 px) |
 | 4 | Heuristic agent chuẩn SGK ở v1 (KHÔNG ML/RL) | Đủ tốt, dễ debug, không cần training data lớn |
 | 5 | MEmu emulator + ADB | User chỉ định |
-| 6 | Synthetic dataset từ 52 ảnh lá + augment | Tiết kiệm label tay |
+| 6 | Synthetic dataset từ 52 ảnh lá + 1 back + augment | Tiết kiệm label tay; dùng cho cả TableReader YOLO và HandReader corner classifier |
 | 7 | Heuristic priority: 3♠ đi trước → dump lẻ nhỏ → không phá đôi/sám → chặt 2 bằng bom | Theo CLAUDE.md user |
-| 8 | YOLO 53 classes (52 lá + 1 back) | Cần track lá úp để đếm lá đối thủ |
+| 8 | **Multi-model** thay vì single YOLO 53 classes: TableReader YOLO 52 classes (lá ngửa giữa bàn), HandReader rank-classifier 13 + suit-classifier 4 (corner crop), OpponentReader đếm back không cần model | HandReader corner ~20x25 px → classifier robust hơn detector |
+| 9 | `SeatMap` (seat ↔ display_name) gắn vào mọi log event | Replay/debug bắt buộc biết chính xác người chơi nào |
 
 Nếu một quyết định trên thay đổi → update `AGENTS.md` trong cùng PR.
 
@@ -171,16 +260,27 @@ Nếu một quyết định trên thay đổi → update `AGENTS.md` trong cùng
 
 Một agent comment vào PR hoặc chat user để **claim** task trước khi code, tránh đụng.
 
-### 🔥 Ưu tiên cao — vision pipeline (cần đầu tiên để bot "nhìn" được)
+### 🔥 Ưu tiên cao — vision pipeline multi-reader (xem §3.5)
+
+Thứ tự tối ưu: `vision-calibrate` → `vision-layout-router` → `vision-extract` → (4 reader song song) → `vision-pipeline-integrate`.
 
 | Task ID | Mô tả | File output | Khó | ~Time |
 |---|---|---|---|---|
-| `vision-extract` | `scripts/extract_cards_from_screenshot.py` — cắt lá từ screenshot game | scripts/* | Easy | 2-3h |
-| `vision-synth` | `scripts/synthetic_generator.py` — render 10K ảnh fan-out (3 scales: hand 75x125, table 50x85, opp 40x70) + multi-background | scripts/*, dataset/* | Medium | 4-6h |
-| `vision-train` | `scripts/train_yolov8n.py` Windows/CUDA, output `weights/best.pt` + benchmark FPS | scripts/*, weights/* | Easy | 2-3h |
-| `vision-calibrate` | Đo ROI thực từ screenshots, update `vision/layout.py` | src/agenttienlen/vision/layout.py | Easy | 1h |
+| `vision-calibrate` | Đo ROI thực từ screenshots (MY_HAND, TABLE, OPP_*, BUTTONS, TURN_INDICATOR, AVATAR_*) → `vision/layout.py` | `src/agenttienlen/vision/layout.py` | Easy | 1-2h |
+| `vision-layout-router` | `LayoutRouter.split(frame)` trả ROI crops + `Rect` per region | `src/agenttienlen/vision/layout_router.py` + tests | Easy | 2h |
+| `vision-extract` | `scripts/extract_cards_from_screenshot.py` — cắt 52 lá (nguồn cho synth) + corner crops + 1 back | `scripts/extract_cards_from_screenshot.py` | Easy | 2-3h |
+| `vision-hand-reader` | Slot segmenter + corner crop + **rank-13 classifier + suit-4 classifier** + stabilizer | `src/agenttienlen/vision/hand_segmenter.py`, `card_corner_classifier.py`, `hand_reader.py` + tests | Medium | 6-8h |
+| `vision-table-reader` | `TableReader` — YOLOv8 detect lá ngửa (52 classes) + combo parse từ `core/classify.py` | `src/agenttienlen/vision/table_reader.py` + `scripts/train_table_yolo.py` + tests | Medium | 4-6h |
+| `vision-opponent-reader` | `OpponentReader` — đếm back-card per seat (edge/contour) | `src/agenttienlen/vision/opponent_reader.py` + tests | Easy | 2-3h |
+| `vision-identity-reader` | `PlayerIdentityReader` — OCR display_name + crop avatar → `SeatMap` | `src/agenttienlen/vision/identity_reader.py` + tests | Medium | 4-5h |
+| `vision-turn-detector` | Detect nút `Đánh`/`Bỏ`/`Bỏ lượt` + highlight seat + timer | `src/agenttienlen/vision/turn_detector.py` + tests | Medium | 3-4h |
+| `vision-pipeline-integrate` | `StructuredFramePipeline.read()` ghép 5 reader + stabilizer | `src/agenttienlen/vision/pipeline.py` + tests | Easy | 2-3h |
+| `vision-synth-corner` | Synth corner crops cho rank-13 + suit-4 classifier (augment: rotation, blur, lighting, partial occlusion) | `scripts/synthetic_corner_generator.py` + dataset | Medium | 3-4h |
+| `vision-synth-table` | Synth full-card images cho TableReader YOLO | `scripts/synthetic_table_generator.py` + dataset | Medium | 3-4h |
 
 ### 🟡 Ưu tiên trung — orchestrator safety + io reliability (chạy song song với vision)
+
+Các task này không bị block bởi vision, có thể claim song song từ đầu.
 
 Đây là layer an toàn để bot **không click bừa** — phải có TRƯỚC khi cho bot chạy thật.
 Spec chi tiết: §3.2 (state machine), §3.3 (stabilizer), §3.4 (replay logger).
@@ -305,19 +405,37 @@ agenttienlen/
 └── tests/            62 tests cho core/memory/agent
 ```
 
-Sau khi vision có dataset, thêm:
+Sau khi vision multi-reader có dataset + weights, thêm:
 
 ```
+src/agenttienlen/vision/
+├── layout_router.py             (vision-layout-router)
+├── hand_segmenter.py            (vision-hand-reader)
+├── card_corner_classifier.py    (vision-hand-reader)
+├── hand_reader.py               (vision-hand-reader)
+├── table_reader.py              (vision-table-reader)
+├── opponent_reader.py           (vision-opponent-reader)
+├── identity_reader.py           (vision-identity-reader)
+├── turn_detector.py             (vision-turn-detector)
+├── stabilizer.py                (vision-stabilizer)
+└── pipeline.py                  (vision-pipeline-integrate)
+
 scripts/
-├── extract_cards_from_screenshot.py
-├── synthetic_generator.py
-└── train_yolov8n.py
+├── extract_cards_from_screenshot.py  (vision-extract)
+├── synthetic_corner_generator.py     (vision-synth-corner)
+├── synthetic_table_generator.py      (vision-synth-table)
+├── train_corner_classifier.py        (vision-hand-reader)
+└── train_table_yolo.py               (vision-table-reader)
+
 dataset/
-├── images/{train,val,test}/*.jpg
-├── labels/{train,val,test}/*.txt
+├── corner/{train,val,test}/<class>/*.jpg   (rank+suit classifier)
+├── table/{images,labels}/{train,val,test}/*  (table YOLO)
 └── data.yaml
+
 weights/
-└── best.pt
+├── corner_rank.pt
+├── corner_suit.pt
+└── table_yolo.pt
 ```
 
 Sau khi orchestrator safety + replay làm xong, thêm:
