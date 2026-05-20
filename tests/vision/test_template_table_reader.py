@@ -112,6 +112,47 @@ class TestTemplateTableReader:
         result = table_reader.read(crop)
         assert len(result.cards) == 0
 
+    def test_opponent_play_areas(self, table_reader, router) -> None:
+        """Test detection on individual opponent play area crops."""
+        from agenttienlen.vision.layout import RegionName
+
+        frame = _load_screenshot("Screenshot_20260520-065839.png")
+        crops = router.split(frame)
+
+        for region in [
+            RegionName.OPP_PLAY_LEFT,
+            RegionName.OPP_PLAY_TOP,
+            RegionName.OPP_PLAY_RIGHT,
+        ]:
+            crop = crops.get(region)
+            if crop is None:
+                continue
+            result = table_reader.read(crop)
+            # Each opponent play area might have 0-5 cards
+            assert isinstance(result.cards, list)
+            assert len(result.cards) <= 13  # sanity: no more than a full hand
+
+    def test_multiple_screenshots(self, table_reader, router) -> None:
+        """Detection should not crash on any screenshot."""
+        from agenttienlen.vision.layout import RegionName
+
+        for name in [
+            "Screenshot_20260520-065907.png",
+            "Screenshot_20260520-065957.png",
+            "Screenshot_20260520-070050.png",
+            "Screenshot_20260520-070114.png",
+        ]:
+            path = SCREENSHOT_DIR / name
+            if not path.exists():
+                continue
+            frame = _load_screenshot(name)
+            crops = router.split(frame)
+            table_crop = crops.get(RegionName.TABLE)
+            if table_crop is None:
+                continue
+            result = table_reader.read(table_crop)
+            assert isinstance(result.cards, list)
+
 
 # ---- Synthetic tests (always run in CI, no fixtures needed) ----
 
@@ -230,44 +271,3 @@ class TestTemplateTableReaderSynthetic:
         if len(result.cards) >= 2:
             xs = [c.bbox.x for c in result.cards]
             assert xs == sorted(xs)
-
-    def test_opponent_play_areas(self, table_reader, router) -> None:
-        """Test detection on individual opponent play area crops."""
-        from agenttienlen.vision.layout import RegionName
-
-        frame = _load_screenshot("Screenshot_20260520-065839.png")
-        crops = router.split(frame)
-
-        for region in [
-            RegionName.OPP_PLAY_LEFT,
-            RegionName.OPP_PLAY_TOP,
-            RegionName.OPP_PLAY_RIGHT,
-        ]:
-            crop = crops.get(region)
-            if crop is None:
-                continue
-            result = table_reader.read(crop)
-            # Each opponent play area might have 0-5 cards
-            assert isinstance(result.cards, list)
-            assert len(result.cards) <= 13  # sanity: no more than a full hand
-
-    def test_multiple_screenshots(self, table_reader, router) -> None:
-        """Detection should not crash on any screenshot."""
-        from agenttienlen.vision.layout import RegionName
-
-        for name in [
-            "Screenshot_20260520-065907.png",
-            "Screenshot_20260520-065957.png",
-            "Screenshot_20260520-070050.png",
-            "Screenshot_20260520-070114.png",
-        ]:
-            path = SCREENSHOT_DIR / name
-            if not path.exists():
-                continue
-            frame = _load_screenshot(name)
-            crops = router.split(frame)
-            table_crop = crops.get(RegionName.TABLE)
-            if table_crop is None:
-                continue
-            result = table_reader.read(table_crop)
-            assert isinstance(result.cards, list)
