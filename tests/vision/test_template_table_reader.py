@@ -112,6 +112,125 @@ class TestTemplateTableReader:
         result = table_reader.read(crop)
         assert len(result.cards) == 0
 
+
+# ---- Synthetic tests (always run in CI, no fixtures needed) ----
+
+
+class TestTemplateTableReaderSynthetic:
+    """Deterministic tests using generated images — always run in CI."""
+
+    @staticmethod
+    def _make_synthetic_store():
+        import numpy as np
+
+        from agenttienlen.core.card import Card, Rank, Suit
+        from agenttienlen.vision.template_utils import TemplateEntry, TemplateStore
+
+        entries = []
+        by_rank: dict[Rank, list[TemplateEntry]] = {}
+        by_card: dict[Card, TemplateEntry] = {}
+        for i, suit in enumerate(Suit):
+            card = Card(rank=Rank.FIVE, suit=suit)
+            rng = np.random.RandomState(100 + i)
+            img = rng.randint(0, 255, (80, 40, 3), dtype=np.uint8)
+            gray = img.mean(axis=2).astype(np.uint8)
+            top_crop = gray[: 80 * 30 // 100, :]
+            entry = TemplateEntry(card=card, image=img, gray=gray, top_crop_gray=top_crop)
+            entries.append(entry)
+            by_rank.setdefault(card.rank, []).append(entry)
+            by_card[card] = entry
+        return TemplateStore(entries=entries, by_rank=by_rank, by_card=by_card)
+
+    def test_empty_crop_returns_empty(self) -> None:
+        import numpy as np
+
+        from agenttienlen.vision.layout import ROI, RegionName
+        from agenttienlen.vision.layout_router import RegionCrop
+        from agenttienlen.vision.template_table_reader import TemplateTableReader
+
+        store = self._make_synthetic_store()
+        reader = TemplateTableReader(store, threshold=0.9)
+        black = np.zeros((200, 600, 3), dtype=np.uint8)
+        crop = RegionCrop(
+            region=RegionName.TABLE,
+            roi=ROI(RegionName.TABLE, 0, 0, 600, 200),
+            image=black,
+            offset=(0, 0),
+        )
+        result = reader.read(crop)
+        assert len(result.cards) == 0
+
+    def test_detects_embedded_card(self) -> None:
+        """Embed a scaled template and verify detection."""
+        import numpy as np
+
+        from agenttienlen.vision.layout import ROI, RegionName
+        from agenttienlen.vision.layout_router import RegionCrop
+        from agenttienlen.vision.readers import TableReadResult
+        from agenttienlen.vision.template_table_reader import TemplateTableReader
+
+        store = self._make_synthetic_store()
+        entry = store.entries[0]
+        # Scale template to 0.55x (within default scale range)
+        import cv2
+
+        scaled = cv2.resize(
+            entry.gray,
+            (int(entry.gray.shape[1] * 0.55), int(entry.gray.shape[0] * 0.55)),
+        )
+        sh, sw = scaled.shape
+
+        canvas = np.zeros((200, 600, 3), dtype=np.uint8)
+        canvas[30 : 30 + sh, 100 : 100 + sw, 0] = scaled
+        canvas[30 : 30 + sh, 100 : 100 + sw, 1] = scaled
+        canvas[30 : 30 + sh, 100 : 100 + sw, 2] = scaled
+
+        reader = TemplateTableReader(store, threshold=0.85)
+        crop = RegionCrop(
+            region=RegionName.TABLE,
+            roi=ROI(RegionName.TABLE, 0, 0, 600, 200),
+            image=canvas,
+            offset=(0, 0),
+        )
+        result = reader.read(crop)
+        assert isinstance(result, TableReadResult)
+        assert len(result.cards) >= 1
+
+    def test_results_sorted_by_x(self) -> None:
+        """Multiple embedded cards should be returned left-to-right."""
+        import cv2
+        import numpy as np
+
+        from agenttienlen.vision.layout import ROI, RegionName
+        from agenttienlen.vision.layout_router import RegionCrop
+        from agenttienlen.vision.template_table_reader import TemplateTableReader
+
+        store = self._make_synthetic_store()
+        canvas = np.zeros((200, 600, 3), dtype=np.uint8)
+
+        for idx, x_pos in enumerate([80, 300]):
+            entry = store.entries[idx % len(store.entries)]
+            scaled = cv2.resize(
+                entry.gray,
+                (int(entry.gray.shape[1] * 0.55), int(entry.gray.shape[0] * 0.55)),
+            )
+            sh, sw = scaled.shape
+            canvas[30 : 30 + sh, x_pos : x_pos + sw, 0] = scaled
+            canvas[30 : 30 + sh, x_pos : x_pos + sw, 1] = scaled
+            canvas[30 : 30 + sh, x_pos : x_pos + sw, 2] = scaled
+
+        reader = TemplateTableReader(store, threshold=0.85)
+        crop = RegionCrop(
+            region=RegionName.TABLE,
+            roi=ROI(RegionName.TABLE, 0, 0, 600, 200),
+            image=canvas,
+            offset=(0, 0),
+        )
+        result = reader.read(crop)
+        if len(result.cards) >= 2:
+            xs = [c.bbox.x for c in result.cards]
+            assert xs == sorted(xs)
+
     def test_opponent_play_areas(self, table_reader, router) -> None:
         """Test detection on individual opponent play area crops."""
         from agenttienlen.vision.layout import RegionName
