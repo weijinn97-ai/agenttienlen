@@ -44,3 +44,5 @@ dataset/labels/
 
 # Synthetic data outputs
 synthetic_out/
+data/
+tests/fixtures/screenshots/
